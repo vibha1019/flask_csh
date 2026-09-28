@@ -158,6 +158,11 @@ class User(db.Model, UserMixin):
     _class = db.Column(db.JSON, unique=False, nullable=True)
     _school = db.Column(db.String(255), default="Unknown", nullable=True)
     _game_profile = db.Column(db.JSON, unique=False, nullable=True)
+    # Bumped every time the password actually changes (set_password). Embedded in issued
+    # JWTs and in the Flask-Login session id (see get_id) and checked on every request, so
+    # a stolen JWT or session cookie stops working the moment this account's password is
+    # reset, instead of staying valid for the rest of its lifetime.
+    token_version = db.Column(db.Integer, default=0, nullable=False)
 
     # Define many-to-many relationship with Section model through UserSection table
     # Overlaps setting silences SQLAlchemy warnings about multiple relationship paths
@@ -188,9 +193,12 @@ class User(db.Model, UserMixin):
         self._school = school
         self._game_profile = game_profile if game_profile else None
 
-    # UserMixin/Flask-Login requires a get_id method to return the id as a string
+    # UserMixin/Flask-Login requires a get_id method to return the id as a string.
+    # Composite id (id:token_version) so load_user (main.py) can reject a session cookie
+    # whose token_version doesn't match the account's current one -- see token_version
+    # column comment above.
     def get_id(self):
-        return str(self.id)
+        return f"{self.id}:{self.token_version}"
 
     # UserMixin/Flask-Login requires is_authenticated to be defined
     @property
@@ -271,10 +279,16 @@ class User(db.Model, UserMixin):
         """Set password: hash if not already hashed, else set directly."""
         if password and password.startswith("pbkdf2:sha256:"):
             # Already hashed, set directly
-            self._password = password
+            new_hash = password
         else:
             # Not hashed, hash it
-            self._password = generate_password_hash(password, "pbkdf2:sha256", salt_length=10)            
+            new_hash = generate_password_hash(password, "pbkdf2:sha256", salt_length=10)
+
+        # Only bump on an actual change, so idempotent operations (e.g. re-importing the
+        # same hash during a data restore) don't needlessly invalidate live sessions/JWTs.
+        if new_hash != self._password:
+            self.token_version = (self.token_version or 0) + 1
+        self._password = new_hash            
 
     # check password parameter versus stored/encrypted password
     def is_password(self, password):

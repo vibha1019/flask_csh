@@ -23,7 +23,6 @@ Usage:
 import json
 import os
 import shutil
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -70,39 +69,97 @@ PAGINATED_TYPES = {
     'leaderboard', 'elementary_leaderboard', 'skill_snapshots',
 }
 
+# ── Target safety guard ───────────────────────────────────────────────────────
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+
+
+def sqlite_path(uri):
+    """Absolute on-disk path for a sqlite:/// URI, anchored to the repo root.
+
+    PERSISTENCE_PREFIX ("instance") is injected here because Flask-SQLAlchemy
+    resolves a relative sqlite:/// URI relative to app.instance_path, not the
+    repo root or CWD -- confirmed against the actual on-disk db file, which
+    really does live at instance/volumes/user_management.db even though the
+    configured URI is sqlite:///volumes/user_management.db. A version of this
+    function that stripped sqlite:/// without re-adding "instance/" would
+    point at a path that doesn't exist.
+    """
+    return os.path.join(ROOT, uri.replace('sqlite:///', f"{PERSISTENCE_PREFIX}/"))
+
+
+def assert_target_is_sqlite():
+    """Refuse to run unless the app is bound to a local SQLite file.
+
+    This script calls db.drop_all() on whatever database `db` is bound to, and
+    __init__.py selects MySQL whenever DB_ENDPOINT / DB_USERNAME / DB_PASSWORD
+    are set. A production .env sitting in the working directory therefore turns
+    "pull prod down to sqlite" into "wipe prod", so check the target first.
+    """
+    db_string = app.config['SQLALCHEMY_DATABASE_STRING']
+    if db_string.startswith('sqlite'):
+        return
+
+    print("ERROR: refusing to run - the target database is not SQLite.")
+    print(f"  engine: {db_string.split(':', 1)[0] or 'unknown'}")
+    print(f"  host:   {app.config['DB_ENDPOINT']}")
+    print(f"  schema: {app.config['SQLALCHEMY_DATABASE_NAME']}")
+    print()
+    print("This script drops and recreates every table in the target, so running")
+    print("it against that database would destroy it rather than populate a local")
+    print("SQLite file.")
+    print()
+    print("DB_ENDPOINT / DB_USERNAME / DB_PASSWORD are being read from .env, and")
+    print("__init__.py picks MySQL whenever all three are non-empty. Blank them for")
+    print("this run so it falls back to sqlite:///volumes/ — note that `env -u` does")
+    print("NOT work here, because load_dotenv() refills unset vars straight from .env:")
+    print("  DB_ENDPOINT= DB_USERNAME= DB_PASSWORD= \\")
+    print("      python scripts/db_migrate-prod2sqlite.py")
+    sys.exit(1)
+
+
 # ── Database backup / creation helpers ────────────────────────────────────────
 
+BACKUP_DIR = os.path.join(ROOT, PERSISTENCE_PREFIX, 'backups')
+
+
 def backup_database(db_uri, backup_uri, db_string):
-    """Back up the current database before overwriting it."""
-    db_name = db_uri.split('/')[-1]
+    """Copy the local SQLite file aside.
 
-    if 'mysql' in db_string:
-        backup_file = f"{db_name}_backup.sql"
-        os.environ['MYSQL_PWD'] = app.config["DB_PASSWORD"]
-        try:
-            subprocess.run(
-                ['mysqldump', '-h', app.config["DB_ENDPOINT"],
-                 '-u', app.config["DB_USERNAME"],
-                 f'-p{app.config["DB_PASSWORD"]}', db_name, '>', backup_file],
-                check=True, shell=True,
-            )
-            print(f"MySQL database backed up to {backup_file}")
-        except subprocess.CalledProcessError as e:
-            print(f"mysqldump failed: {e}")
-        finally:
-            del os.environ['MYSQL_PWD']
+    Returns True when a rollback point exists (or when there is nothing to lose
+    yet). The caller must not drop tables when this returns False.
+    """
+    if not db_string.startswith('sqlite'):
+        # assert_target_is_sqlite() runs first, so this is unreachable via main().
+        print("ERROR: backups are only supported for SQLite targets.")
+        return False
 
-    elif 'sqlite' in db_string:
+    db_path = sqlite_path(db_uri)
+    if not os.path.exists(db_path) or os.path.getsize(db_path) == 0:
+        print(f"No existing data at {db_path}; nothing to back up.")
+        return True
+
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    dump_path = os.path.join(BACKUP_DIR, f"{os.path.basename(db_path)}.{timestamp}.bak")
+
+    try:
+        shutil.copyfile(db_path, dump_path)
         if backup_uri:
-            db_path     = db_uri.replace('sqlite:///', f"{PERSISTENCE_PREFIX}/")
-            backup_path = backup_uri.replace('sqlite:///', f"{PERSISTENCE_PREFIX}/")
-            shutil.copyfile(db_path, backup_path)
-            print(f"SQLite database backed up to {backup_path}")
-        else:
-            print("Backup not supported for production database.")
+            # Keep the configured *_bak.db convenience copy up to date too.
+            shutil.copyfile(db_path, sqlite_path(backup_uri))
+    except OSError as e:
+        print(f"ERROR: could not back up {db_path}: {e}")
+        return False
 
-    else:
-        print("Unsupported database type for backup.")
+    size = os.path.getsize(dump_path)
+    if size != os.path.getsize(db_path):
+        print(f"ERROR: backup {dump_path} is truncated ({size} bytes).")
+        return False
+
+    print(f"SQLite database backed up to {dump_path} ({size} bytes)")
+    print(f"Roll back with: cp {dump_path} {db_path}")
+    return True
 
 
 def create_database_if_missing(engine, db_name):
@@ -764,22 +821,34 @@ def load_all(all_data):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    # Step 0: Warn user and back up existing database
+    # Step 0: Confirm the target is local, warn, and back up existing database
+    assert_target_is_sqlite()
+
     with app.app_context():
         try:
             inspector = db.inspect(db.engine)
             if inspector.get_table_names():
-                print("Warning: you are about to lose all data in your local SQLite database!")
-                print("Do you want to continue? (y/n)")
-                if input().lower() != 'y':
+                target = sqlite_path(app.config['SQLALCHEMY_DATABASE_URI'])
+                print(f"Warning: every table in {target} is about to be dropped")
+                print("and rebuilt from production data.")
+                if os.getenv('FORCE_YES') == 'true':
+                    response = 'y'
+                else:
+                    print("Do you want to continue? (y/n)")
+                    response = input()
+                if response.lower() != 'y':
                     print("Exiting without making changes.")
                     sys.exit(0)
 
-            backup_database(
+            backed_up = backup_database(
                 app.config['SQLALCHEMY_DATABASE_URI'],
                 app.config['SQLALCHEMY_BACKUP_URI'],
                 app.config['SQLALCHEMY_DATABASE_STRING'],
             )
+            if not backed_up and os.getenv('ALLOW_NO_BACKUP') != 'true':
+                print("\nRefusing to drop the database without a rollback point.")
+                print("Fix the backup above, or set ALLOW_NO_BACKUP=true to override.")
+                sys.exit(1)
 
         except OperationalError as e:
             if "Unknown database" in str(e):
@@ -851,6 +920,8 @@ def main():
     print("\n=== Step 3: Building new schema and loading data ===")
     try:
         with app.app_context():
+            # Re-check immediately before the destructive call.
+            assert_target_is_sqlite()
             db.drop_all()
             print("All tables dropped.")
             db.create_all()

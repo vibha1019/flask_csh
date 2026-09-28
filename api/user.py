@@ -1,7 +1,11 @@
+import base64
+import hashlib
+import hmac
 import jwt
+import threading
 from flask import Blueprint, app, request, jsonify, current_app, Response, g
 from flask_restful import Api, Resource # used for REST API building
-from datetime import datetime
+from datetime import datetime, timedelta
 from __init__ import app, db
 from api.authorize import token_required
 from model.user import User
@@ -14,14 +18,89 @@ user_api = Blueprint('user_api', __name__,
 # API docs https://flask-restful.readthedocs.io/en/latest/api.html
 api = Api(user_api)
 
-class UserAPI:        
+# Tokens this process has already spent, so a captured token can't be replayed against
+# Flask again within its own TTL -- Spring enforces single-use on its side too (consumed
+# when the frontend calls /reset/oauth/complete), but that's a separate record Flask has
+# no visibility into, so this endpoint needs its own. Keyed by the full token string;
+# swept lazily since each entry's own expiry means it's safe to forget once that time
+# passes -- nobody can replay an expired token anyway.
+_consumed_reset_tokens = {}
+_consumed_reset_tokens_lock = threading.Lock()
+
+
+def _verify_reset_token(uid, token):
+    """Verifies a password-reset token issued by Spring's ResetCode.java, entirely
+    locally -- no network call back to Spring. Same HMAC-SHA256 scheme on both
+    sides, keyed by the RESET_TOKEN_SECRET both backends are independently
+    configured with: token = base64url(uid) + "." + expiresAt + "." + nonce + "."
+    + signature, where signature = HMAC-SHA256(secret, f"{uid}.{expiresAt}.{nonce}").
+    Signature + expiry only -- callers that need single-use enforcement (this file's
+    reset-password endpoint) must check/record consumption themselves.
+    """
+    if not uid or not token:
+        return False, None
+
+    parts = token.split('.')
+    if len(parts) != 4:
+        return False, None
+    _uid_b64, exp_str, nonce, signature = parts
+
+    try:
+        exp = int(exp_str)
+    except ValueError:
+        return False, None
+    if datetime.utcnow().timestamp() > exp:
+        return False, None
+
+    secret = current_app.config.get('RESET_TOKEN_SECRET')
+    if not secret:
+        return False, None
+
+    payload = f"{uid}.{exp}.{nonce}".encode('utf-8')
+    expected_sig = base64.urlsafe_b64encode(
+        hmac.new(secret.encode('utf-8'), payload, hashlib.sha256).digest()
+    ).decode('utf-8').rstrip('=')
+
+    return hmac.compare_digest(expected_sig, signature), exp
+
+
+def _consume_reset_token(uid, token):
+    """Verifies the token (signature + expiry) and, only if it hasn't been spent
+    against this endpoint before, marks it spent and returns True. Single-use
+    enforcement local to Flask -- see _verify_reset_token's docstring."""
+    valid, exp = _verify_reset_token(uid, token)
+    if not valid:
+        return False
+
+    now = datetime.utcnow().timestamp()
+    with _consumed_reset_tokens_lock:
+        for stored_token, stored_exp in list(_consumed_reset_tokens.items()):
+            if stored_exp <= now:
+                del _consumed_reset_tokens[stored_token]
+
+        if token in _consumed_reset_tokens:
+            return False
+
+        _consumed_reset_tokens[token] = exp
+        return True
+
+
+def _without_password(user_data):
+    """Strip the password hash before a user dict goes out over a general-purpose
+    API response. The admin-only backup/export endpoints in data_export_import_api.py
+    call user.read() directly instead of this, since restoring from a backup needs
+    the hash to round-trip."""
+    user_data.pop('password', None)
+    return user_data
+
+class UserAPI:
     class _ID(Resource):  # Individual identification API operation
         @token_required()
         def get(self):
             ''' Retrieve the current user from the token_required authentication check '''
             current_user = g.current_user
             ''' Return the current user as a json object with role information '''
-            user_data = current_user.read()
+            user_data = _without_password(current_user.read())
             # Add role information to response
             user_data['role'] = current_user.role
             user_data['is_admin'] = current_user.is_admin()
@@ -150,13 +229,13 @@ class UserAPI:
                     db_user = User.query.filter_by(_uid=uid).first()
                     if db_user:
                         #print(f"User exists in DB but create returned None: {db_user.uid}")
-                        return jsonify(db_user.read())  # Return the user anyway
+                        return jsonify(_without_password(db_user.read()))  # Return the user anyway
                     else:
                         return {'message': f'Processed {name}, either a format error or User ID {uid} is duplicate'}, 400
-                
+
                 #print(f"Successfully created user: {user.uid}")
                 # return response, the created user details as a JSON object
-                return jsonify(user.read())
+                return jsonify(_without_password(user.read()))
                 
             except Exception as e:
                 #print(f"Error creating user: {e}")
@@ -198,9 +277,9 @@ class UserAPI:
                 total = len(users)
              
             # prepare a json list of user dictionaries
-            json_ready = []  
+            json_ready = []
             for user in users:
-                user_data = user.read()
+                user_data = _without_password(user.read())
                 # Add access control
                 if current_user.role == 'Admin' or current_user.id == user.id:
                     user_data['access'] = ['rw'] # read-write access control 
@@ -262,9 +341,9 @@ class UserAPI:
             
             # Update the User object to the database using custom update method
             user.update(body)
-            
+
             # return response, the updated user details as a JSON object
-            return jsonify(user.read())
+            return jsonify(_without_password(user.read()))
         
         @token_required("Admin")
         def delete(self):
@@ -287,7 +366,7 @@ class UserAPI:
                 return {'message': f'User {uid} not found'}, 404
            
             # Read and then Delete the User object using custom methods
-            user_json = user.read()
+            user_json = _without_password(user.read())
             user.delete()
             
             # 204 is the status code for delete with no json response
@@ -392,8 +471,16 @@ class UserAPI:
                 # Check if user is found
                 if user:
                     try:
+                        # exp ties the token's server-enforced lifetime to the cookie's
+                        # client-side max_age (previously the token never expired by JWT
+                        # semantics at all). token_version is checked on every request in
+                        # auth_required -- see model/user.py's token_version column comment.
                         token = jwt.encode(
-                            {"_uid": user._uid},
+                            {
+                                "_uid": user._uid,
+                                "token_version": user.token_version,
+                                "exp": datetime.utcnow() + timedelta(seconds=current_app.config["JWT_TOKEN_MAX_AGE"]),
+                            },
                             current_app.config["SECRET_KEY"],
                             algorithm="HS256"
                         )
@@ -716,15 +803,49 @@ class UserAPI:
                     # Check if user was actually created in database
                     db_user = User.query.filter_by(_uid=uid).first()
                     if db_user:
-                        return jsonify(db_user.read())
+                        return jsonify(_without_password(db_user.read()))
                     else:
                         return {'message': f'Failed to create guest account for {uid}, username may already exist'}, 400
 
                 # Return the created user details
-                return jsonify(user.read())
+                return jsonify(_without_password(user.read()))
 
             except Exception as e:
                 return {'message': f'Error creating guest user: {str(e)}'}, 500
+
+    class _ResetPasswordVerified(Resource):
+        """
+        Sets this uid's Flask password using a short-lived, single-use token
+        issued by Spring's POST /mvc/person/reset/oauth/verify. Called directly
+        by the frontend, not by Spring -- Flask verifies the token's HMAC
+        signature and expiry itself (RESET_TOKEN_SECRET, shared with Spring but
+        never sent over the wire between the two backends), so there is no
+        Spring -> Flask network call. Flask is the source of truth for this
+        password write; the frontend syncs Spring's copy separately afterward by
+        calling Spring's /reset/oauth/complete with the same token.
+        """
+        def post(self):
+            body = request.get_json(silent=True) or {}
+            uid = body.get('uid')
+            reset_token = body.get('resetToken')
+            password = body.get('newPassword')
+
+            if not uid or not reset_token or not password:
+                return {'message': 'uid, resetToken, and newPassword are required'}, 400
+            if len(password) < 8:
+                return {'message': 'Password must be at least 8 characters'}, 400
+            if not _consume_reset_token(uid, reset_token):
+                return {'message': 'Invalid, expired, or already-used reset token'}, 403
+
+            user = User.query.filter_by(_uid=uid).first()
+            if user is None:
+                return {'message': f'User {uid} not found'}, 404
+
+            updated = user.update({'password': password})
+            if updated is None:
+                # update() returns None on IntegrityError (already rolled back internally).
+                return {'message': f'Failed to reset password for {uid}'}, 500
+            return {'message': f'Password reset for {uid}'}, 200
 
     # building RESTapi endpoint
     api.add_resource(_ID, '/id')
@@ -736,6 +857,7 @@ class UserAPI:
     api.add_resource(_GradeData, '/grade_data')
     api.add_resource(_APExam, '/apexam')
     api.add_resource(_School, '/school')
+    api.add_resource(_ResetPasswordVerified, '/reset-password')
     
     class _Class(Resource):
         """Manage the user's `class` list (e.g. CSSE, CSP, CSA).

@@ -112,7 +112,26 @@ def unauthorized_callback():
 # register URIs for server pages
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    # user_id is the composite "id:token_version" from User.get_id(). A mismatched
+    # token_version means the session predates a password change on this account --
+    # returning None here tells Flask-Login the session is invalid.
+    #
+    # A session issued before this field existed at all has no ":" -- treat that as
+    # token_version "0" (matching a fresh/unchanged account) instead of invalidating
+    # it outright. It still correctly fails below once the account's real
+    # token_version has moved past 0 from an actual password change.
+    if ":" in user_id:
+        raw_id, token_version = user_id.split(":", 1)
+    else:
+        raw_id, token_version = user_id, "0"
+    try:
+        raw_id = int(raw_id)
+    except ValueError:
+        return None
+    user = User.query.get(raw_id)
+    if user is None or str(user.token_version) != token_version:
+        return None
+    return user
 
 @app.context_processor
 def inject_user():

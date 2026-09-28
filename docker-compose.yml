@@ -1,20 +1,29 @@
 version: '3'
 services:
-        web:
-                image: flask_open
-                build: .
-                env_file:
-                        - .env # This file is optional; defaults will be used if it does not exist
-                ports:
-                        - "8587:8587"
-                volumes:
-                        - ./instance:/app/instance
-                restart: unless-stopped
+  web:
+    image: flask_open
+    build: .
+    env_file:
+      - .env # This file is optional; defaults will be used if it does not exist
+    ports:
+      - "8587:8587"
+    volumes:
+      - ./instance:/app/instance
+    restart: unless-stopped
 
-        socketio:
-                image: socket_open
-                build: ./socket
-                ports:
-                        - "8500:8500"
-    
-                restart: unless-stopped
+  socketio:
+    image: socket_open
+    build: ./socket
+    ports:
+      - "8500:8500"
+    restart: unless-stopped
+
+  code_runner:
+    image: flask_runner
+    build: ./runner
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: "1.0"
+    pids_limit: 128
+    restart: unless-stopped
