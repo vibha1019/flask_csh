@@ -111,6 +111,7 @@ pip install -r requirements.txt
   ```
 
   - Explore newly created SQL database
+    - Be sure to install SQLite3 Editor from VSCode Marketplace
     - Navigate too instance/volumes
     - View/open `user_management.db`
     - Loook at `users` table in viewer
