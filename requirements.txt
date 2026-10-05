@@ -25,4 +25,4 @@ python-docx
 # ---------------------------------------------------------
 # insightface
 # onnxruntime
-# opencv-python
+# opencv-pythontzdata  # zoneinfo data for the bell schedule on slim images

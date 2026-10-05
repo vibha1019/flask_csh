@@ -1,72 +1,52 @@
 """
 RFID Attendance API — the RFID reader (a headless CrowPi, not a logged-in
-user) phones a tap event home here. OCS resolves the tag, applies the
-enter/exit toggle, and is the source of truth for the resulting attendance
-record. Admin-facing endpoints (registering a tag, listing events) use the
-normal user auth; the scan endpoint itself uses a shared API key instead,
-the same pattern already used for the snapshot automator in
-api/snapshot_proxy.py, since the device has no OCS login of its own.
+user) phones a tap event home here. /scan is now a thin wrapper around the
+generic presence API (api/presence_api.py), kept so readers that have not
+switched to /api/presence/event keep working. Admin-facing endpoints
+(registering a tag, listing events) use the normal user auth; the scan
+endpoint uses the shared device API key, since the device has no OCS login
+of its own.
 """
 
-import os
-from datetime import datetime
-from functools import wraps
+import uuid
 
 from flask import Blueprint, request, jsonify, g
 from __init__ import db
-from model.attendance import RfidTag, AttendanceEvent
+from model.attendance import RfidTag
 from model.classroom import Classroom
+from model.presence import PresenceEvent, to_iso_z, utc_now
 from model.user import User
 from api.authorize import token_required
+from api.presence_api import PresenceError, record_event, require_device_api_key
 
 rfid_api = Blueprint('rfid_api', __name__, url_prefix='/api/rfid')
 
-RFID_API_KEY = os.environ.get("RFID_API_KEY", "")
-
-
-def require_rfid_api_key(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        if not RFID_API_KEY:
-            return jsonify({"message": "RFID_API_KEY not configured on server"}), 500
-        key = request.headers.get('X-API-Key', '')
-        if key != RFID_API_KEY:
-            return jsonify({"message": "Invalid or missing API key"}), 401
-        return func(*args, **kwargs)
-    return wrapper
-
 
 @rfid_api.route('/scan', methods=['POST'])
-@require_rfid_api_key
+@require_device_api_key
 def scan():
-    """The reader calls this on every tap. No user login involved, this is
-    device-to-server, authenticated by the API key above."""
-    data = request.get_json(force=True)
-    tag_uid = str(data.get('tag_uid', '')).strip()
-    classroom_id = data.get('classroom_id')
-
-    if not tag_uid or not classroom_id:
+    """The reader calls this on every tap. Forwards to the generic presence
+    event handler as source=rfid. Older readers that do not send event_id
+    or occurred_at get a fresh id and the server's receive time."""
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"message": "JSON object body required"}), 400
+    if not data.get('tag_uid') or not data.get('classroom_id'):
         return jsonify({"message": "tag_uid and classroom_id required"}), 400
 
-    tag = RfidTag.query.filter_by(_tag_uid=tag_uid).first()
-    if not tag:
-        return jsonify({"message": f"tag {tag_uid} is not registered", "status": "unregistered"}), 404
-
-    classroom = Classroom.query.get(classroom_id)
-    if not classroom:
-        return jsonify({"message": f"no classroom {classroom_id}"}), 404
-
-    last_event = (
-        AttendanceEvent.query.filter_by(_user_id=tag.user_id, _classroom_id=classroom_id)
-        .order_by(AttendanceEvent._timestamp.desc())
-        .first()
-    )
-    next_type = "exit" if last_event and last_event.type == "enter" else "enter"
-
-    event = AttendanceEvent(user_id=tag.user_id, classroom_id=classroom_id, type=next_type)
-    event.create()
-
-    return jsonify({"status": "accepted", "event": event.to_dict()}), 200
+    event = {
+        "event_id": data.get("event_id") or str(uuid.uuid4()),
+        "source": "rfid",
+        "classroom_id": data.get("classroom_id"),
+        "occurred_at": data.get("occurred_at") or to_iso_z(utc_now()),
+        "tag_uid": str(data.get("tag_uid")).strip(),
+        "device_id": data.get("device_id"),
+    }
+    try:
+        body, status = record_event(event)
+    except PresenceError as e:
+        return e.response()
+    return jsonify(body), status
 
 
 @rfid_api.route('/register', methods=['POST'])
@@ -107,8 +87,8 @@ def list_events(classroom_id):
         return jsonify({"message": "Access denied"}), 403
 
     events = (
-        AttendanceEvent.query.filter_by(_classroom_id=classroom_id)
-        .order_by(AttendanceEvent._timestamp.desc())
+        PresenceEvent.query.filter_by(_classroom_id=classroom_id)
+        .order_by(PresenceEvent._occurred_at.desc())
         .limit(200)
         .all()
     )
