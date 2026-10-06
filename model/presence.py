@@ -137,3 +137,62 @@ class PresenceEvent(db.Model):
             'received_at': to_iso_z(self._received_at),
             'device_id': self._device_id,
         }
+
+
+class CameraCheck(db.Model):
+    """The camera's answer for one RFID tap: it took a picture at the tap
+    station and reports whose face it saw. One check per tap; no images are
+    stored, only the result."""
+    __tablename__ = 'camera_checks'
+
+    RESULTS = ('match', 'no_match', 'no_face', 'not_enrolled')
+
+    id = db.Column(db.Integer, primary_key=True)
+    _event_id = db.Column(db.String(64), unique=True, nullable=False)
+    _tap_id = db.Column(db.Integer, db.ForeignKey('presence_events.id'), unique=True, nullable=False)
+    _result = db.Column(db.String(16), nullable=False)
+    _recognized_user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    _confidence = db.Column(db.Float, nullable=True)
+    _occurred_at = db.Column(db.DateTime, nullable=False)
+    _received_at = db.Column(db.DateTime, nullable=False, default=utc_now)
+    _device_id = db.Column(db.String(64), nullable=True)
+
+    tap = db.relationship('PresenceEvent')
+    recognized_user = db.relationship('User')
+
+    def __init__(self, event_id, tap_id, result, recognized_user_id, confidence,
+                 occurred_at, received_at, device_id=None):
+        self._event_id = event_id
+        self._tap_id = tap_id
+        self._result = result
+        self._recognized_user_id = recognized_user_id
+        self._confidence = confidence
+        self._occurred_at = occurred_at
+        self._received_at = received_at
+        self._device_id = device_id
+
+    @property
+    def tap_id(self): return self._tap_id
+
+    @property
+    def verification(self):
+        """VERIFIED: the face is the tag's owner. MISMATCH: someone else or an
+        unknown face (possible proxy tap). NO_FACE: no face in the picture.
+        TAP_ONLY: the student opted out of face scanning (not flagged)."""
+        if self._result == 'match':
+            return 'VERIFIED' if self._recognized_user_id == self.tap.user_id else 'MISMATCH'
+        return {'no_match': 'MISMATCH', 'no_face': 'NO_FACE', 'not_enrolled': 'TAP_ONLY'}[self._result]
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'event_id': self._event_id,
+            'tap_event_id': self.tap.event_id if self.tap else None,
+            'result': self._result,
+            'recognized_uid': self.recognized_user.uid if self.recognized_user else None,
+            'confidence': self._confidence,
+            'verification': self.verification,
+            'occurred_at': to_iso_z(self._occurred_at),
+            'received_at': to_iso_z(self._received_at),
+            'device_id': self._device_id,
+        }

@@ -1,27 +1,42 @@
 """
 Presence API — one input-agnostic endpoint that every presence signal
-(RFID tap, later camera) posts to, plus the period logic that
-turns those events into attendance.
+(RFID tap, camera result) posts to, plus the period logic that turns those
+events into attendance.
 
 Devices authenticate with the shared X-API-Key (RFID_API_KEY), the same
 device-to-server pattern as the original /api/rfid/scan, which is now a
 thin wrapper around record_event() below. Teacher/admin actions use the
 normal OCS login.
 
-Event body:
+RFID tap body:
     {
       "event_id": "<uuid from the device>",     # retries with the same id are not logged twice
-      "source": "rfid" | "camera",
+      "source": "rfid",
       "classroom_id": 1,
       "occurred_at": "2026-10-05T18:42:07.123Z",  # must include Z or an offset
-      "tag_uid": "...",                         # rfid only
-      "uid": "...",                             # camera: the OCS user uid
+      "tag_uid": "...",
       "device_id": "crowpi-room1"               # optional
     }
 
-The server derives the event type: 'enter'/'exit' toggle per user,
+The server derives the tap type: 'enter'/'exit' toggle per user,
 classroom, and period (so it resets every period instead of carrying
 over), or 'ignored' if occurred_at falls outside every period window.
+
+Camera result body (the camera's answer for one tap, see Jarvis3000#17):
+    {
+      "event_id": "<uuid for this result>",
+      "source": "camera",
+      "classroom_id": 1,
+      "tap_event_id": "<event_id of the tap it answers>",
+      "occurred_at": "<when the picture was taken>",
+      "result": "match" | "no_match" | "no_face" | "not_enrolled",
+      "uid": "...",                             # who was recognized; required for match
+      "confidence": 0.93,                       # optional, 0 to 1
+      "device_id": "door-cam"                   # optional
+    }
+
+The camera finds taps to answer by polling
+GET /api/presence/classrooms/<id>/taps/pending.
 """
 
 import os
@@ -36,17 +51,20 @@ from api.authorize import token_required
 from model import bell_schedule
 from model.attendance import RfidTag
 from model.classroom import Classroom
-from model.presence import PresenceEvent, PresencePeriod, to_iso_z, utc_now
+from model.presence import CameraCheck, PresenceEvent, PresencePeriod, to_iso_z, utc_now
 from model.user import User
 
 presence_api = Blueprint('presence_api', __name__, url_prefix='/api/presence')
 
 DEVICE_API_KEY = os.environ.get("RFID_API_KEY", "")
 SOURCES = {"rfid", "camera"}
-SUPPORTED_SOURCES = {"rfid"}  # camera is reserved until its event format is agreed
+SUPPORTED_SOURCES = {"rfid"}  # taps; camera results go through record_camera_result()
 # A device clock running ahead of the server by more than this is treated
 # as wrong, and the server's receive time is used instead.
 MAX_FUTURE_SKEW = timedelta(minutes=2)
+# How long after a tap the camera can still pick it up, and how long the
+# dashboard shows a tap as being checked before calling it unverified.
+CAMERA_WINDOW = timedelta(seconds=15)
 
 
 def require_device_api_key(func):
@@ -69,6 +87,20 @@ class PresenceError(Exception):
 
     def response(self):
         return jsonify({"message": self.message, **self.extra}), self.status_code
+
+
+def require_event_id(data):
+    event_id = str(data.get("event_id") or "").strip()
+    if not event_id or len(event_id) > 64:
+        raise PresenceError("event_id required (max 64 chars)")
+    return event_id
+
+
+def require_classroom(data):
+    classroom_id = data.get("classroom_id")
+    if not isinstance(classroom_id, int) or not Classroom.query.get(classroom_id):
+        raise PresenceError(f"no classroom {classroom_id}", 404)
+    return classroom_id
 
 
 def parse_occurred_at(value):
@@ -151,10 +183,7 @@ def record_event(data):
     """Validates, de-duplicates, and stores one presence event. Returns
     (response_dict, http_status). Raises PresenceError on bad input."""
     received_at = utc_now()
-
-    event_id = str(data.get("event_id") or "").strip()
-    if not event_id or len(event_id) > 64:
-        raise PresenceError("event_id required (max 64 chars)")
+    event_id = require_event_id(data)
 
     existing = PresenceEvent.query.filter_by(_event_id=event_id).first()
     if existing:
@@ -166,9 +195,7 @@ def record_event(data):
     if source not in SUPPORTED_SOURCES:
         raise PresenceError(f"source {source} is not supported yet")
 
-    classroom_id = data.get("classroom_id")
-    if not isinstance(classroom_id, int) or not Classroom.query.get(classroom_id):
-        raise PresenceError(f"no classroom {classroom_id}", 404)
+    classroom_id = require_classroom(data)
 
     occurred_at = parse_occurred_at(data.get("occurred_at"))
     adjusted = False
@@ -223,6 +250,78 @@ def record_event(data):
     return response, 200
 
 
+def record_camera_result(data):
+    """Stores the camera's answer for one tap. One result per tap: a retry
+    with the same event_id is a duplicate, a second result with a new
+    event_id is rejected with 409."""
+    received_at = utc_now()
+    event_id = require_event_id(data)
+
+    existing = CameraCheck.query.filter_by(_event_id=event_id).first()
+    if existing:
+        return {"status": "accepted", "duplicate": True, "check": existing.to_dict()}, 200
+
+    classroom_id = require_classroom(data)
+
+    tap_event_id = str(data.get("tap_event_id") or "").strip()
+    if not tap_event_id:
+        raise PresenceError("tap_event_id required for source camera")
+    tap = PresenceEvent.query.filter_by(_event_id=tap_event_id, _source="rfid").first()
+    if not tap:
+        raise PresenceError(f"no tap with event_id {tap_event_id}", 404)
+    if tap._classroom_id != classroom_id:
+        raise PresenceError(f"tap {tap_event_id} is not in classroom {classroom_id}")
+    if CameraCheck.query.filter_by(_tap_id=tap.id).first():
+        raise PresenceError(f"tap {tap_event_id} already has a camera result", 409, status="already_checked")
+
+    result = data.get("result")
+    if result not in CameraCheck.RESULTS:
+        raise PresenceError(f"result must be one of {list(CameraCheck.RESULTS)}")
+
+    recognized_user = None
+    if result == "match":
+        uid = str(data.get("uid") or "").strip()
+        if not uid:
+            raise PresenceError("uid required when result is match")
+        recognized_user = User.query.filter_by(_uid=uid).first()
+        if not recognized_user:
+            raise PresenceError(f"no user with uid {uid}", 404, status="unregistered")
+
+    confidence = data.get("confidence")
+    if confidence is not None:
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+            raise PresenceError("confidence must be a number from 0 to 1")
+        confidence = float(confidence)
+
+    occurred_at = parse_occurred_at(data.get("occurred_at"))
+    if occurred_at > received_at + MAX_FUTURE_SKEW:
+        occurred_at = received_at
+
+    device_id = data.get("device_id")
+    check = CameraCheck(
+        event_id=event_id,
+        tap_id=tap.id,
+        result=result,
+        recognized_user_id=recognized_user.id if recognized_user else None,
+        confidence=confidence,
+        occurred_at=occurred_at,
+        received_at=received_at,
+        device_id=str(device_id)[:64] if device_id else None,
+    )
+    try:
+        db.session.add(check)
+        db.session.commit()
+    except IntegrityError:
+        # A concurrent request stored this event_id or a result for this tap first.
+        db.session.rollback()
+        existing = CameraCheck.query.filter_by(_event_id=event_id).first()
+        if existing:
+            return {"status": "accepted", "duplicate": True, "check": existing.to_dict()}, 200
+        raise PresenceError(f"tap {tap_event_id} already has a camera result", 409, status="already_checked")
+
+    return {"status": "accepted", "duplicate": False, "check": check.to_dict()}, 200
+
+
 @presence_api.route('/event', methods=['POST'])
 @require_device_api_key
 def post_event():
@@ -230,10 +329,45 @@ def post_event():
     if not isinstance(data, dict):
         return jsonify({"message": "JSON object body required"}), 400
     try:
-        body, status = record_event(data)
+        if data.get("source") == "camera":
+            body, status = record_camera_result(data)
+        else:
+            body, status = record_event(data)
     except PresenceError as e:
         return e.response()
     return jsonify(body), status
+
+
+@presence_api.route('/classrooms/<int:classroom_id>/taps/pending', methods=['GET'])
+@require_device_api_key
+def pending_taps(classroom_id):
+    """Taps from the last CAMERA_WINDOW that the camera has not answered
+    yet. The camera polls this about once a second, takes a picture for
+    each, and posts a camera result back."""
+    if not Classroom.query.get(classroom_id):
+        return jsonify({"message": f"no classroom {classroom_id}"}), 404
+
+    taps = (
+        PresenceEvent.query.outerjoin(CameraCheck, CameraCheck._tap_id == PresenceEvent.id)
+        .filter(
+            CameraCheck.id.is_(None),
+            PresenceEvent._classroom_id == classroom_id,
+            PresenceEvent._source == "rfid",
+            PresenceEvent._type.in_(["enter", "exit"]),
+            PresenceEvent._occurred_at >= utc_now() - CAMERA_WINDOW,
+        )
+        .order_by(PresenceEvent._occurred_at)
+        .all()
+    )
+    return jsonify([
+        {
+            "tap_event_id": tap.event_id,
+            "uid": tap.user.uid if tap.user else None,
+            "occurred_at": to_iso_z(tap.occurred_at),
+            "type": tap.type,
+        }
+        for tap in taps
+    ])
 
 
 @presence_api.route('/periods/start', methods=['POST'])
@@ -264,6 +398,15 @@ def start_period():
     db.session.add(period)
     db.session.commit()
     return jsonify(period.to_dict(now=utc_now())), 201
+
+
+def tap_verification(tap, check, now):
+    """Camera verification for one tap, as shown on the dashboard."""
+    if tap._source != "rfid":
+        return None
+    if check:
+        return check.verification
+    return "PENDING" if now - tap.occurred_at <= CAMERA_WINDOW else "UNVERIFIED"
 
 
 def compute_state(events, period, now):
@@ -333,6 +476,10 @@ def classroom_status(classroom_id):
     )
     for event in period_events:
         events_by_user.setdefault(event.user_id, []).append(event)
+    checks_by_tap = {}
+    if period_events:
+        checks = CameraCheck.query.filter(CameraCheck._tap_id.in_([e.id for e in period_events])).all()
+        checks_by_tap = {c.tap_id: c for c in checks}
 
     for user in sorted(roster.values(), key=lambda u: (u.name or "").lower()):
         events = events_by_user.get(user.id, [])
@@ -343,6 +490,8 @@ def classroom_status(classroom_id):
             "state": compute_state(events, period, now),
             "since": to_iso_z(last.occurred_at) if last else None,
             "last_source": last._source if last else None,
+            # Camera verification of the student's most recent tap.
+            "verification": tap_verification(last, checks_by_tap.get(last.id), now) if last else None,
             "enrolled": user.id in enrolled,
         })
     return jsonify(body)
